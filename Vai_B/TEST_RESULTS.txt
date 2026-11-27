@@ -1,0 +1,24 @@
+Environment: Linux-6.18.57-x86_64-with-glibc2.41 | Python 3.13.5
+Command: python -m unittest -v test_automatic
+
+test_01_fragmented_and_coalesced_frames (test_automatic.TestB.test_01_fragmented_and_coalesced_frames) ... ok
+test_02_chat_two_way_reuse_and_leave (test_automatic.TestB.test_02_chat_two_way_reuse_and_leave) ... ok
+test_03_three_peers_unread (test_automatic.TestB.test_03_three_peers_unread) ... ok
+test_04_binary_hash_and_progress (test_automatic.TestB.test_04_binary_hash_and_progress) ... ok
+test_05_concurrent_bidirectional_file_and_chat (test_automatic.TestB.test_05_concurrent_bidirectional_file_and_chat) ... ok
+test_06_same_name_parallel (test_automatic.TestB.test_06_same_name_parallel) ... ok
+test_07_partial_eof (test_automatic.TestB.test_07_partial_eof) ... ok
+test_08_partial_timeout (test_automatic.TestB.test_08_partial_timeout) ... ok
+test_09_bad_header_and_negative_size (test_automatic.TestB.test_09_bad_header_and_negative_size) ... ok
+test_10_empty_file (test_automatic.TestB.test_10_empty_file) ... ok
+test_11_missing_and_offline (test_automatic.TestB.test_11_missing_and_offline) ... ok
+test_12_old_receiver_cannot_clear_new (test_automatic.TestB.test_12_old_receiver_cannot_clear_new) ... ok
+test_13_abrupt_close (test_automatic.TestB.test_13_abrupt_close) ... ok
+test_14_explicit_open_before_message (test_automatic.TestB.test_14_explicit_open_before_message) ... ok
+test_15_quit_closes_pending_file (test_automatic.TestB.test_15_quit_closes_pending_file) ... ok
+test_16_simultaneous_explicit_open (test_automatic.TestB.test_16_simultaneous_explicit_open) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 14.518s
+
+OK

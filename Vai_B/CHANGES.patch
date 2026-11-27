@@ -1,0 +1,1074 @@
+--- a/config.py
++++ b/config.py
+@@ -23,3 +23,8 @@
+ 
+ # --- Trang thai hop le ---
+ VALID_STATUSES = ("online", "away")
++
++HANDSHAKE_TIMEOUT = 5.0
++FILE_IDLE_TIMEOUT = 10.0
++MAX_MESSAGE_BYTES = 1024 * 1024
++EXPLICIT_CHAT_OPEN = False
+--- a/protocol.py
++++ b/protocol.py
+@@ -11,9 +11,10 @@
+ """
+ 
+ import socket
++import select
+ from typing import Optional, Tuple
+ 
+-from config import MAX_HEADER_FIELD_BYTES, VALID_STATUSES
++from config import MAX_HEADER_FIELD_BYTES, MAX_MESSAGE_BYTES, HANDSHAKE_TIMEOUT, VALID_STATUSES
+ 
+ 
+ class ProtocolError(Exception):
+@@ -51,13 +52,17 @@
+ # ==============================================================================
+ # 2. TCP FRAMING HELPERS — Vai B su dung
+ # ==============================================================================
+-def recv_exact(sock: socket.socket, num_bytes: int) -> bytes:
++def recv_exact(sock: socket.socket, num_bytes: int, idle_timeout=None) -> bytes:
+     """
+     Doc CHINH XAC `num_bytes` byte tu TCP stream (chong nhan thieu goi).
+     Nem EOFError neu ket noi dong giua chung truoc khi du byte.
+     """
++    if num_bytes < 0:
++        raise ProtocolError("Negative payload length.")
+     chunks = bytearray()
+     while len(chunks) < num_bytes:
++        if idle_timeout is not None and not select.select([sock], [], [], idle_timeout)[0]:
++            raise TimeoutError("Payload stalled.")
+         chunk = sock.recv(num_bytes - len(chunks))
+         if not chunk:
+             raise EOFError("Peer closed connection unexpectedly while reading payload.")
+@@ -65,7 +70,7 @@
+     return bytes(chunks)
+ 
+ 
+-def recv_until(sock: socket.socket, delimiter: bytes = b"|", max_bytes: int = MAX_HEADER_FIELD_BYTES) -> Optional[bytes]:
++def recv_until(sock: socket.socket, delimiter: bytes = b"|", max_bytes: int = MAX_HEADER_FIELD_BYTES, idle_timeout=None, wait_first=False) -> Optional[bytes]:
+     """
+     Doc tung byte cho den khi gap `delimiter` (khong bao gom delimiter).
+     - Tra ve None neu peer dong ket noi sach se truoc khi doc duoc byte nao.
+@@ -74,6 +79,8 @@
+     """
+     buf = bytearray()
+     while True:
++        if idle_timeout is not None and (buf or wait_first) and not select.select([sock], [], [], idle_timeout)[0]:
++            raise TimeoutError("Header stalled.")
+         byte = sock.recv(1)
+         if not byte:
+             if len(buf) == 0:
+@@ -88,6 +95,8 @@
+ 
+ def send_hi(sock: socket.socket, name: str, tcp_port: int) -> None:
+     """Gui goi dinh danh dau ket noi TCP: HI|<name>|<tcp_port>|"""
++    if not name.strip() or any(c in name for c in "|\r\n") or len(name.encode("utf-8")) > MAX_HEADER_FIELD_BYTES or not 1 <= tcp_port <= 65535:
++        raise ProtocolError("Invalid HI fields.")
+     payload = f"HI|{name}|{tcp_port}|".encode("utf-8")
+     sock.sendall(payload)
+ 
+@@ -119,7 +128,7 @@
+     except (UnicodeDecodeError, ValueError) as exc:
+         raise ProtocolError("Invalid fields in HI frame.") from exc
+ 
+-    if not name or not (1 <= tcp_port <= 65535):
++    if not name or any(c in name for c in "\r\n") or not (1 <= tcp_port <= 65535):
+         raise ProtocolError("Out-of-range fields in HI frame.")
+ 
+     return (name, tcp_port)
+@@ -128,6 +137,8 @@
+ def send_msg(sock: socket.socket, text: str) -> None:
+     """Gui khung tin nhan chat: MSG|<utf8_byte_length>|<utf8_bytes>"""
+     encoded = text.encode("utf-8")
++    if len(encoded) > MAX_MESSAGE_BYTES:
++        raise ProtocolError("Message too large.")
+     header = f"MSG|{len(encoded)}|".encode("utf-8")
+     sock.sendall(header + encoded)
+ 
+@@ -135,6 +146,8 @@
+ def send_file_header(sock: socket.socket, filename: str, size_bytes: int) -> None:
+     """Gui phan header khung FILE: FILE|<filename>|<size_bytes>| (raw bytes gui theo chunk sau)."""
+     safe_name = filename.replace("|", "_")
++    if not safe_name or len(safe_name.encode("utf-8")) > MAX_HEADER_FIELD_BYTES or size_bytes < 0:
++        raise ProtocolError("Invalid FILE header.")
+     header = f"FILE|{safe_name}|{size_bytes}|".encode("utf-8")
+     sock.sendall(header)
+ 
+@@ -142,3 +155,20 @@
+ def send_bye(sock: socket.socket) -> None:
+     """Gui khung ket thuc chat: BYE|"""
+     sock.sendall(b"BYE|")
++
++
++def read_field(sock: socket.socket) -> bytes:
++    value = recv_until(sock, idle_timeout=HANDSHAKE_TIMEOUT, wait_first=True)
++    if value is None:
++        raise EOFError("Incomplete header.")
++    return value
++
++
++def read_size(sock: socket.socket, maximum: Optional[int] = None) -> int:
++    raw = read_field(sock)
++    if not raw.isdigit():
++        raise ProtocolError("Invalid size field.")
++    size = int(raw)
++    if maximum is not None and size > maximum:
++        raise ProtocolError("Payload too large.")
++    return size
+--- a/state.py
++++ b/state.py
+@@ -38,6 +38,10 @@
+         # Ket noi TCP chat dang mo (toi da 1 ket noi/cap peer):
+         # { (ip, tcp_port): socket.socket }
+         self.chat_conns: Dict[PeerKey, socket.socket] = {}
++        self._chat_ranks = {}
++        self._active_sockets = set()
++        self._socket_condition = threading.Condition(self.state_lock)
++        self._unread_messages: Dict[PeerKey, List[str]] = {}
+ 
+         # Lich su tin nhan theo tung peer:
+         # { (ip, tcp_port): ["[Quan] hello", "[Minh] hi", ...] }
+@@ -131,6 +135,7 @@
+         with self.state_lock:
+             old = self.chat_conns.get(peer_key)
+             self.chat_conns[peer_key] = sock
++            self._chat_ranks.pop(peer_key, None)
+             return old
+ 
+     def get_chat_conn(self, peer_key: PeerKey) -> Optional[socket.socket]:
+@@ -142,15 +147,58 @@
+         Xoa ket noi chat cua peer_key. Neu peer_key dang la current_partner thi dat ve None.
+         Tra ve True neu peer_key tung la current_partner.
+         """
+-        was_current = False
+         with self.state_lock:
+             cur_sock = self.chat_conns.get(peer_key)
+-            if cur_sock is not None and (expected_sock is None or cur_sock is expected_sock):
+-                del self.chat_conns[peer_key]
++            if expected_sock is not None and cur_sock is not expected_sock:
++                return False
++            self.chat_conns.pop(peer_key, None)
++            self._chat_ranks.pop(peer_key, None)
+             if self.current_partner == peer_key:
+                 self.current_partner = None
+-                was_current = True
+-        return was_current
++                return True
++            return False
++
++    def offer_chat_conn(self, peer_key, sock, rank):
++        with self.state_lock:
++            old = self.chat_conns.get(peer_key)
++            if old is sock:
++                return True, None
++            if self.stop_event.is_set():
++                return False, None
++            old_rank = self._chat_ranks.get(peer_key)
++            if old is not None and old_rank is not None and old_rank <= rank:
++                return False, None
++            self.chat_conns[peer_key] = sock
++            self._chat_ranks[peer_key] = rank
++            return True, old
++
++    def track_socket(self, sock):
++        with self.state_lock:
++            if self.stop_event.is_set():
++                return False
++            self._active_sockets.add(sock)
++            return True
++
++    def untrack_socket(self, sock):
++        with self._socket_condition:
++            self._active_sockets.discard(sock)
++            self._socket_condition.notify_all()
++
++    def wait_for_socket_cleanup(self, timeout):
++        with self._socket_condition:
++            return self._socket_condition.wait_for(lambda: not self._active_sockets, timeout)
++
++    def get_active_sockets(self):
++        with self.state_lock:
++            return list(self._active_sockets)
++
++    def activate_chat(self, peer_key):
++        with self.state_lock:
++            if peer_key not in self.chat_conns:
++                return None
++            self.current_partner = peer_key
++            self.unread_counts[peer_key] = 0
++            return self._unread_messages.pop(peer_key, [])
+ 
+     def record_incoming_message(self, peer_key: PeerKey, sender_name: str, text: str) -> Tuple[bool, int]:
+         """
+@@ -167,10 +215,27 @@
+                 return (True, 0)
+             if self.current_partner == peer_key:
+                 return (True, 0)
++            self._unread_messages.setdefault(peer_key, []).append(line)
+             new_unread = self.unread_counts.get(peer_key, 0) + 1
+             self.unread_counts[peer_key] = new_unread
+             return (False, new_unread)
+ 
++    def record_incoming_for_socket(self, peer_key, sock, sender_name, text):
++        line = f"[{sender_name}] {text}"
++        with self.state_lock:
++            if self.chat_conns.get(peer_key) is not sock:
++                return None
++            self.chat_history.setdefault(peer_key, []).append(line)
++            if self.current_partner is None or self.current_partner == peer_key:
++                self.current_partner = peer_key
++                self.unread_counts[peer_key] = 0
++                backlog = self._unread_messages.pop(peer_key, [])
++                return True, 0, backlog
++            self._unread_messages.setdefault(peer_key, []).append(line)
++            count = self.unread_counts.get(peer_key, 0) + 1
++            self.unread_counts[peer_key] = count
++            return False, count, []
++
+     def record_outgoing_message(self, peer_key: PeerKey, text: str) -> None:
+         line = f"[{self.my_name}] {text}"
+         with self.state_lock:
+@@ -183,12 +248,8 @@
+         """
+         with self.state_lock:
+             self.current_partner = peer_key
+-            unread = self.unread_counts.get(peer_key, 0)
+             self.unread_counts[peer_key] = 0
+-            history = self.chat_history.get(peer_key, [])
+-            if unread > 0:
+-                return list(history[-unread:])
+-            return []
++            return self._unread_messages.pop(peer_key, [])
+ 
+     def get_all_chat_conns(self) -> List[Tuple[PeerKey, socket.socket]]:
+         with self.state_lock:
+--- a/tcp_manager.py
++++ b/tcp_manager.py
+@@ -2,67 +2,66 @@
+ import threading
+ from typing import Optional, TYPE_CHECKING
+ 
+-from config import CONNECT_TIMEOUT, SOCKET_TIMEOUT
++from config import CONNECT_TIMEOUT, SOCKET_TIMEOUT, HANDSHAKE_TIMEOUT, MAX_MESSAGE_BYTES, EXPLICIT_CHAT_OPEN
+ from file_transfer import FileSender, receive_file
+-from protocol import (
+-    ProtocolError,
+-    recv_exact,
+-    recv_hi,
+-    recv_until,
+-    send_bye,
+-    send_hi,
+-    send_msg,
+-)
++from protocol import ProtocolError, recv_exact, recv_hi, recv_until, read_field, read_size, send_bye, send_hi, send_msg
+ 
+ if TYPE_CHECKING:
+     from state import PeerKey, SharedState
+     from ui import ConsoleUI
+ 
+ 
++def _close_socket(sock):
++    try:
++        sock.shutdown(socket.SHUT_RDWR)
++    except OSError:
++        pass
++    sock.close()
++
++
++def _offer_chat(state, peer_key, sock):
++    rank = tuple(sorted((sock.getsockname()[:2], sock.getpeername()[:2])))
++    accepted, old = state.offer_chat_conn(peer_key, sock, rank)
++    if old is not None:
++        _close_socket(old)
++    return accepted
++
++
+ class TCPAcceptor(threading.Thread):
+-    def __init__(self, state: "SharedState", ui: "ConsoleUI") -> None:
++    def __init__(self, state, ui):
+         super().__init__(name="TCPAcceptor", daemon=True)
+         self.state = state
+         self.ui = ui
+-
+-    def run(self) -> None:
+-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+-        try:
+-            srv.bind(("0.0.0.0", self.state.my_tcp_port))
+-            srv.listen(10)
+-            srv.settimeout(SOCKET_TIMEOUT)
+-
+-            while not self.state.stop_event.is_set():
+-                try:
+-                    conn, addr = srv.accept()
+-                except socket.timeout:
+-                    continue
+-                except OSError:
+-                    break
+-
+-                receiver = TCPReceiver(
+-                    conn, addr[0], self.state, self.ui, is_incoming=True
+-                )
+-                receiver.start()
++        self.ready = threading.Event()
++        self.error = None
++
++    def run(self):
++        try:
++            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
++                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++                srv.bind(("0.0.0.0", self.state.my_tcp_port))
++                srv.listen(10)
++                srv.settimeout(SOCKET_TIMEOUT)
++                self.ready.set()
++                while not self.state.stop_event.is_set():
++                    try:
++                        conn, addr = srv.accept()
++                    except socket.timeout:
++                        continue
++                    if not self.state.track_socket(conn):
++                        _close_socket(conn)
++                        break
++                    TCPReceiver(conn, addr[0], self.state, self.ui).start()
++        except OSError as exc:
++            self.error = exc
++            if not self.state.stop_event.is_set():
++                self.ui.safe_print(f"[!] TCP listener error: {exc}")
+         finally:
+-            try:
+-                srv.close()
+-            except OSError:
+-                pass
++            self.ready.set()
+ 
+ 
+ class TCPReceiver(threading.Thread):
+-    def __init__(
+-        self,
+-        sock: socket.socket,
+-        peer_ip: str,
+-        state: "SharedState",
+-        ui: "ConsoleUI",
+-        is_incoming: bool = True,
+-        known_peer_key: Optional["PeerKey"] = None,
+-        known_peer_name: str = "",
+-    ) -> None:
++    def __init__(self, sock, peer_ip, state, ui, is_incoming=True, known_peer_key=None, known_peer_name=""):
+         super().__init__(daemon=True)
+         self.sock = sock
+         self.peer_ip = peer_ip
+@@ -72,222 +71,178 @@
+         self.peer_key = known_peer_key
+         self.peer_name = known_peer_name
+ 
+-    def run(self) -> None:
+-        is_chat_conn = not self.is_incoming
+-        try:
+-            # 1. Nếu là người khác kết nối tới mình -> phải đọc gói chào HI trước
++    def run(self):
++        is_chat = not self.is_incoming
++        reason = None
++        try:
+             if self.is_incoming:
+-                self.peer_name, peer_tcp_port = recv_hi(self.sock)
+-                self.peer_key = (self.peer_ip, peer_tcp_port)
+-
+-            # 2. Vòng lặp đọc tin nhắn / file / lệnh rời đi
++                self.sock.settimeout(HANDSHAKE_TIMEOUT)
++                self.peer_name, port = recv_hi(self.sock)
++                self.peer_key = (self.peer_ip, port)
++                self.sock.settimeout(None)
+             while not self.state.stop_event.is_set():
+-                cmd_bytes = recv_until(self.sock, b"|")
+-                if cmd_bytes is None:
+-                    if is_chat_conn and self.peer_name:
+-                        self.ui.safe_print(
+-                            f"[!] Connection lost with {self.peer_name}."
+-                        )
++                cmd = recv_until(self.sock, idle_timeout=HANDSHAKE_TIMEOUT)
++                if cmd is None:
++                    reason = "Connection lost"
+                     break
+-
+-                cmd = cmd_bytes.decode("utf-8")
+-
+-                if cmd == "MSG":
+-                    if not is_chat_conn and self.peer_key is not None:
+-                        is_chat_conn = True
+-                        old_sock = self.state.register_chat_conn(
+-                            self.peer_key, self.sock
+-                        )
+-                        if old_sock is not None and old_sock is not self.sock:
+-                            try:
+-                                old_sock.close()
+-                            except OSError:
+-                                pass
+-
+-                    len_bytes = recv_until(self.sock, b"|")
+-                    if len_bytes is None:
+-                        raise EOFError("Incomplete MSG length.")
+-                    length = int(len_bytes.decode("utf-8"))
+-
+-                    raw = recv_exact(self.sock, length)
+-                    text = raw.decode("utf-8")
+-
+-                    if self.peer_key is not None:
+-                        is_active, unread = self.state.record_incoming_message(
+-                            self.peer_key, self.peer_name, text
+-                        )
+-                        if is_active:
+-                            self.ui.safe_print(f"[{self.peer_name}] {text}")
+-                        else:
+-                            self.ui.safe_print(
+-                                f"[*] New message from {self.peer_name} ({unread} unread)"
+-                            )
+-
+-                elif cmd == "FILE":
+-                    fn_bytes = recv_until(self.sock, b"|")
+-                    sz_bytes = recv_until(self.sock, b"|")
+-                    if fn_bytes is None or sz_bytes is None:
+-                        raise EOFError("Incomplete FILE header.")
+-                    filename = fn_bytes.decode("utf-8")
+-                    size = int(sz_bytes.decode("utf-8"))
+-
++                if cmd == b"CHAT" and not is_chat and self.is_incoming:
++                    if not _offer_chat(self.state, self.peer_key, self.sock):
++                        break
++                    is_chat = True
++                elif cmd == b"MSG":
++                    length = read_size(self.sock, MAX_MESSAGE_BYTES)
++                    text = recv_exact(self.sock, length, idle_timeout=HANDSHAKE_TIMEOUT).decode("utf-8")
++                    if not is_chat:
++                        if not _offer_chat(self.state, self.peer_key, self.sock):
++                            break
++                        is_chat = True
++                    result = self.state.record_incoming_for_socket(self.peer_key, self.sock, self.peer_name, text)
++                    if result is None:
++                        break
++                    active, unread, backlog = result
++                    if active:
++                        for line in backlog:
++                            self.ui.safe_print(line)
++                        self.ui.safe_print(f"[{self.peer_name}] {text}")
++                    else:
++                        self.ui.safe_print(f"[*] New message from {self.peer_name} ({unread} unread)")
++                elif cmd == b"FILE" and not is_chat:
++                    filename = read_field(self.sock).decode("utf-8")
++                    size = read_size(self.sock)
+                     receive_file(self.sock, filename, size, self.peer_name, self.ui)
+                     break
+-
+-                elif cmd == "BYE":
+-                    self.ui.safe_print(f"[*] {self.peer_name} left the chat.")
++                elif cmd == b"BYE":
++                    reason = "left the chat"
++                    if not is_chat:
++                        self.ui.safe_print(f"[*] {self.peer_name}: {reason}")
+                     break
+-
+                 else:
+-                    raise ProtocolError(f"Unknown frame command: {cmd}")
+-
+-        except (
+-            ProtocolError,
+-            EOFError,
+-            ValueError,
+-            UnicodeDecodeError,
+-            ConnectionResetError,
+-            OSError,
+-        ):
+-            if is_chat_conn and self.peer_name and not self.state.stop_event.is_set():
+-                self.ui.safe_print(f"[!] Disconnected from {self.peer_name}.")
++                    raise ProtocolError(f"Unexpected frame: {cmd!r}")
++        except (ProtocolError, EOFError, ValueError, OSError) as exc:
++            reason = f"Disconnected: {exc}"
++            if not is_chat and not self.state.stop_event.is_set():
++                self.ui.safe_print(f"[!] Rejected TCP connection: {exc}")
+         finally:
+-            if is_chat_conn and self.peer_key is not None:
+-                was_current = self.state.remove_chat_conn(
+-                    self.peer_key, expected_sock=self.sock
+-                )
+-                if was_current and not self.state.stop_event.is_set():
+-                    self.ui.safe_print("[*] Returned to main prompt.")
+-            try:
+-                self.sock.close()
+-            except OSError:
+-                pass
+-
+-
+-def handle_chat_command(target: str, state: "SharedState", ui: "ConsoleUI") -> None:
++            if is_chat and self.peer_key is not None:
++                with self.state.state_lock:
++                    owned = self.state.chat_conns.get(self.peer_key) is self.sock
++                was_current = self.state.remove_chat_conn(self.peer_key, expected_sock=self.sock)
++                if owned and not self.state.stop_event.is_set():
++                    if reason:
++                        self.ui.safe_print(f"[*] {self.peer_name}: {reason}")
++                    if was_current:
++                        self.ui.safe_print("[*] Returned to main prompt.")
++            self.state.untrack_socket(self.sock)
++            _close_socket(self.sock)
++
++
++def handle_chat_command(target, state, ui):
+     target = target.strip()
+     if not target:
+         ui.safe_print("[!] Usage: /chat <name|number>")
+         return
+-
+     resolved = state.resolve_peer(target)
+     if resolved is None:
+         ui.safe_print(f"[!] Peer not found: {target}")
+         return
+-
+-    peer_key, peer_info = resolved
+-    peer_name = peer_info["name"]
+-
+-    sock = state.get_chat_conn(peer_key)
+-    if sock is None:
+-        try:
+-            sock = socket.create_connection(peer_key, timeout=CONNECT_TIMEOUT)
++    key, info = resolved
++    name = info["name"]
++    if state.get_chat_conn(key) is None:
++        sock = None
++        try:
++            sock = socket.create_connection(key, timeout=CONNECT_TIMEOUT)
++            if not state.track_socket(sock):
++                _close_socket(sock)
++                return
++            send_hi(sock, state.my_name, state.my_tcp_port)
+             sock.settimeout(None)
+-            send_hi(sock, state.my_name, state.my_tcp_port)
+-        except OSError as exc:
+-            ui.safe_print(f"[!] Cannot connect to {peer_name}: {exc}")
+-            return
+-
+-        old_sock = state.register_chat_conn(peer_key, sock)
+-        if old_sock is not None and old_sock is not sock:
+-            try:
+-                old_sock.close()
+-            except OSError:
+-                pass
+-
+-        receiver = TCPReceiver(
+-            sock,
+-            peer_key[0],
+-            state,
+-            ui,
+-            is_incoming=False,
+-            known_peer_key=peer_key,
+-            known_peer_name=peer_name,
+-        )
+-        receiver.start()
+-
+-    unread_msgs = state.switch_to_partner(peer_key)
+-    ui.safe_print(f"[*] Connected/Switched to {peer_name}")
+-    for msg in unread_msgs:
++            if _offer_chat(state, key, sock):
++                if EXPLICIT_CHAT_OPEN:
++                    sock.sendall(b"CHAT|")
++                TCPReceiver(sock, key[0], state, ui, False, key, name).start()
++            else:
++                state.untrack_socket(sock)
++                _close_socket(sock)
++        except (OSError, ProtocolError) as exc:
++            if sock is not None:
++                state.remove_chat_conn(key, expected_sock=sock)
++                state.untrack_socket(sock)
++                _close_socket(sock)
++            if state.get_chat_conn(key) is None:
++                ui.safe_print(f"[!] Cannot connect to {name}: {exc}")
++                return
++    unread = state.activate_chat(key)
++    if unread is None:
++        ui.safe_print(f"[!] Chat connection lost with {name}.")
++        return
++    ui.safe_print(f"[*] Connected/Switched to {name}")
++    for msg in unread:
+         ui.safe_print(msg)
+ 
+ 
+-def handle_send_text(text: str, state: "SharedState", ui: "ConsoleUI") -> None:
++def handle_send_text(text, state, ui):
+     with state.state_lock:
+         partner = state.current_partner
+-
++        sock = state.chat_conns.get(partner)
+     if partner is None:
+         ui.safe_print("[!] Not in a chat. Use /chat <name|number> first.")
+         return
+-
+-    sock = state.get_chat_conn(partner)
+     if sock is None:
+-        state.remove_chat_conn(partner)
+         ui.safe_print("[!] Chat connection lost.")
+         return
+-
+     try:
+         send_msg(sock, text)
+         state.record_outgoing_message(partner, text)
++    except ProtocolError as exc:
++        ui.safe_print(f"[!] {exc}")
+     except OSError as exc:
+         state.remove_chat_conn(partner, expected_sock=sock)
+-        try:
+-            sock.close()
+-        except OSError:
+-            pass
++        _close_socket(sock)
+         ui.safe_print(f"[!] Failed to send message: {exc}")
+ 
+ 
+-def handle_leave_command(state: "SharedState", ui: "ConsoleUI") -> None:
++def handle_leave_command(state, ui):
+     with state.state_lock:
+         partner = state.current_partner
+-
++        sock = state.chat_conns.get(partner)
+     if partner is None:
+         ui.safe_print("[!] You are not in a chat.")
+         return
+-
+-    sock = state.get_chat_conn(partner)
++    state.remove_chat_conn(partner, expected_sock=sock)
+     if sock is not None:
+         try:
+             send_bye(sock)
+         except OSError:
+             pass
+-        try:
+-            sock.close()
+-        except OSError:
+-            pass
+-
+-    state.remove_chat_conn(partner)
++        _close_socket(sock)
+     ui.safe_print("[*] Chat closed.")
+ 
+ 
+-def handle_send_file_command(
+-    filepath: str, state: "SharedState", ui: "ConsoleUI"
+-) -> None:
++def handle_send_file_command(filepath, state, ui):
+     with state.state_lock:
+         partner = state.current_partner
+-
+     if partner is None:
+         ui.safe_print("[!] Not in a chat. Use /chat <name|number> first.")
+         return
+-
+-    clean_path = filepath.strip()
+-    if not clean_path:
++    path = filepath.strip()
++    if len(path) >= 2 and path[0] == path[-1] and path[0] in ("'", '"'):
++        path = path[1:-1]
++    if not path:
+         ui.safe_print("[!] Usage: /send <file_path>")
+         return
+-
+-    peer_name = state.get_peer_name(partner)
+-    sender = FileSender(partner, peer_name, clean_path, state, ui)
++    sender = FileSender(partner, state.get_peer_name(partner), path, state, ui)
+     sender.start()
+-
+-
+-def close_all_chats(state: "SharedState") -> None:
+-    for _, sock in state.get_all_chat_conns():
++    return sender
++
++
++def close_all_chats(state):
++    for key, sock in state.get_all_chat_conns():
++        state.remove_chat_conn(key, expected_sock=sock)
+         try:
+             send_bye(sock)
+         except OSError:
+             pass
+-        try:
+-            sock.close()
+-        except OSError:
+-            pass+        _close_socket(sock)
++    for sock in state.get_active_sockets():
++        _close_socket(sock)
++    state.wait_for_socket_cleanup(2.0)
+--- a/file_transfer.py
++++ b/file_transfer.py
+@@ -1,36 +1,41 @@
+ import os
+ import socket
+ import threading
+-from typing import TYPE_CHECKING
++import time
+ 
+-from config import CHUNK_SIZE, CONNECT_TIMEOUT, DOWNLOAD_DIR, PROGRESS_MILESTONES
+-from protocol import send_file_header, send_hi
++from config import CHUNK_SIZE, CONNECT_TIMEOUT, DOWNLOAD_DIR, FILE_IDLE_TIMEOUT, PROGRESS_MILESTONES
++from protocol import ProtocolError, send_file_header, send_hi
+ 
+-if TYPE_CHECKING:
+-    from state import PeerKey, SharedState
+-    from ui import ConsoleUI
++_path_lock = threading.Lock()
++_reserved = set()
++DEMO_CHUNK_DELAY = 0.0
+ 
+ 
+-def _get_unique_filepath(directory: str, filename: str) -> str:
+-    clean_name = os.path.basename(filename) or "received_file"
+-    base, ext = os.path.splitext(clean_name)
+-    candidate = os.path.join(directory, clean_name)
+-    counter = 1
+-    while os.path.exists(candidate):
+-        candidate = os.path.join(directory, f"{base}_({counter}){ext}")
+-        counter += 1
+-    return candidate
++def _reserve_filepath(directory, filename):
++    clean = filename.replace("\\", "/").rsplit("/", 1)[-1]
++    if clean in ("", ".", "..") or "\x00" in clean or any(c in clean for c in "\r\n"):
++        raise ProtocolError("Invalid filename.")
++    base, ext = os.path.splitext(clean)
++    with _path_lock:
++        n = 0
++        while True:
++            name = clean if n == 0 else f"{base}_({n}){ext}"
++            final = os.path.abspath(os.path.join(directory, name))
++            part = final + ".part"
++            if not any(x in _reserved or os.path.lexists(x) for x in (final, part)):
++                _reserved.update((final, part))
++                return final, part
++            n += 1
++
++
++def _release_filepath(final, part):
++    with _path_lock:
++        _reserved.discard(final)
++        _reserved.discard(part)
+ 
+ 
+ class FileSender(threading.Thread):
+-    def __init__(
+-        self,
+-        peer_key: "PeerKey",
+-        peer_name: str,
+-        filepath: str,
+-        state: "SharedState",
+-        ui: "ConsoleUI",
+-    ) -> None:
++    def __init__(self, peer_key, peer_name, filepath, state, ui):
+         super().__init__(name=f"FileSender-{os.path.basename(filepath)}", daemon=True)
+         self.peer_key = peer_key
+         self.peer_name = peer_name
+@@ -38,101 +43,80 @@
+         self.state = state
+         self.ui = ui
+ 
+-    def run(self) -> None:
+-        # 1. Kiểm tra file có tồn tại trên máy không
+-        if not os.path.isfile(self.filepath):
+-            self.ui.safe_print(f"[!] File not found: {self.filepath}")
+-            return
+-
++    def run(self):
++        sock = None
+         filename = os.path.basename(self.filepath)
+-        file_size = os.path.getsize(self.filepath)
+-        sock = None
+-
+         try:
+-            # 2. Kết nối tới máy bạn bè và chào hỏi
+-            sock = socket.create_connection(self.peer_key, timeout=CONNECT_TIMEOUT)
+-            send_hi(sock, self.state.my_name, self.state.my_tcp_port)
+-            send_file_header(sock, filename, file_size)
+-
+-            # 3. Nếu file rỗng 0 byte thì báo 100% luôn
+-            if file_size == 0:
+-                self.ui.safe_print(f"[*] Sending {filename} to {self.peer_name}: 100%")
+-                self.ui.safe_print("[*] File sent successfully.")
++            if not os.path.isfile(self.filepath):
++                self.ui.safe_print(f"[!] File not found: {self.filepath}")
+                 return
+-
+-            # 4. Đọc từng cục 64KB và gửi đi
+-            sent_bytes = 0
+-            milestone_idx = 0
+             with open(self.filepath, "rb") as f:
+-                while True:
+-                    chunk = f.read(CHUNK_SIZE)
++                size = os.fstat(f.fileno()).st_size
++                sock = socket.create_connection(self.peer_key, timeout=CONNECT_TIMEOUT)
++                if not self.state.track_socket(sock):
++                    return
++                sock.settimeout(FILE_IDLE_TIMEOUT)
++                send_hi(sock, self.state.my_name, self.state.my_tcp_port)
++                send_file_header(sock, filename, size)
++                sent = 0
++                idx = 0
++                while sent < size:
++                    if self.state.stop_event.is_set():
++                        raise OSError("Application stopping.")
++                    chunk = f.read(min(CHUNK_SIZE, size - sent))
+                     if not chunk:
+-                        break
++                        raise EOFError("Source file was truncated.")
+                     sock.sendall(chunk)
+-                    sent_bytes += len(chunk)
+-
+-                    percent = int(sent_bytes * 100 / file_size)
+-                    while (
+-                        milestone_idx < len(PROGRESS_MILESTONES)
+-                        and percent >= PROGRESS_MILESTONES[milestone_idx]
+-                    ):
+-                        m = PROGRESS_MILESTONES[milestone_idx]
+-                        self.ui.safe_print(
+-                            f"[*] Sending {filename} to {self.peer_name}: {m}%"
+-                        )
+-                        milestone_idx += 1
+-
+-            self.ui.safe_print("[*] File sent successfully.")
+-
+-        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
++                    sent += len(chunk)
++                    while idx < len(PROGRESS_MILESTONES) and sent * 100 >= PROGRESS_MILESTONES[idx] * size:
++                        m = PROGRESS_MILESTONES[idx]
++                        self.ui.safe_print(f"[*] Sending {filename} to {self.peer_name}: {m}%")
++                        idx += 1
++                    if DEMO_CHUNK_DELAY:
++                        time.sleep(DEMO_CHUNK_DELAY)
++                if size == 0:
++                    self.ui.safe_print(f"[*] Sending {filename} to {self.peer_name}: 100%")
++                sock.shutdown(socket.SHUT_WR)
++                self.ui.safe_print("[*] File bytes sent (receiver save not confirmed).")
++        except (OSError, EOFError, ProtocolError, ValueError) as exc:
+             self.ui.safe_print(f"[!] File transfer interrupted: {exc}")
+         finally:
+             if sock is not None:
+-                try:
+-                    sock.close()
+-                except OSError:
+-                    pass
++                self.state.untrack_socket(sock)
++                sock.close()
+ 
+ 
+-def receive_file(
+-    sock: socket.socket,
+-    filename: str,
+-    size_bytes: int,
+-    sender_name: str,
+-    ui: "ConsoleUI",
+-) -> None:
+-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+-    final_path = _get_unique_filepath(DOWNLOAD_DIR, filename)
+-    temp_path = final_path + ".part"
+-
+-    ui.safe_print(
+-        f"[*] Receiving {filename} ({size_bytes} bytes) from {sender_name}..."
+-    )
+-
++def receive_file(sock, filename, size_bytes, sender_name, ui):
++    final = part = None
++    created = False
+     try:
++        if size_bytes < 0:
++            raise ProtocolError("Negative file size.")
++        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
++        final, part = _reserve_filepath(DOWNLOAD_DIR, filename)
++        ui.safe_print(f"[*] Receiving {filename} ({size_bytes} bytes) from {sender_name}...")
++        sock.settimeout(FILE_IDLE_TIMEOUT)
+         received = 0
+-        with open(temp_path, "wb") as f:
++        with open(part, "xb") as f:
++            created = True
+             while received < size_bytes:
+-                to_read = min(CHUNK_SIZE, size_bytes - received)
+-                chunk = sock.recv(to_read)
++                chunk = sock.recv(min(CHUNK_SIZE, size_bytes - received))
+                 if not chunk:
+                     raise EOFError("Connection lost during file transfer.")
+                 f.write(chunk)
+                 received += len(chunk)
+-
+-        # Nhận đủ 100% -> đổi tên file .part thành file thật
+-        os.replace(temp_path, final_path)
+-        ui.safe_print(
+-            f"[*] Received {filename} from {sender_name} -> saved to {final_path}"
+-        )
+-
+-    except (EOFError, OSError):
+-        # Lỗi giữa chừng -> xóa ngay file .part
+-        if os.path.exists(temp_path):
++        os.replace(part, final)
++        created = False
++        ui.safe_print(f"[*] Received {filename} from {sender_name} -> saved to {final}")
++        return True
++    except (EOFError, OSError, ProtocolError, ValueError) as exc:
++        if created:
+             try:
+-                os.remove(temp_path)
+-            except OSError:
+-                pass
+-        ui.safe_print(
+-            f"[!] Failed to receive {filename} from {sender_name} (partial file deleted)."
+-        )+                os.remove(part)
++            except OSError as cleanup_error:
++                ui.safe_print(f"[!] Cannot delete partial file: {cleanup_error}")
++        ui.safe_print(f"[!] Failed to receive {filename} from {sender_name}: {exc}")
++        return False
++    finally:
++        if final is not None:
++            _release_filepath(final, part)
+--- a/test_vai_b.py
++++ b/test_vai_b.py
+@@ -1,71 +1,98 @@
+-import sys
++import argparse
+ import threading
++import os
++import file_transfer
++import tcp_manager
+ from state import SharedState
+-from tcp_manager import (
+-    TCPAcceptor,
+-    close_all_chats,
+-    handle_chat_command,
+-    handle_leave_command,
+-    handle_send_file_command,
+-    handle_send_text,
+-)
++from tcp_manager import TCPAcceptor, close_all_chats, handle_chat_command, handle_leave_command, handle_send_file_command, handle_send_text
+ 
+ 
+ class SimpleUI:
+-    def __init__(self) -> None:
++    def __init__(self):
+         self.ui_lock = threading.Lock()
+ 
+-    def safe_print(self, msg: str) -> None:
++    def safe_print(self, msg):
+         with self.ui_lock:
+-            print(f"\r{msg}\n> ", end="", flush=True)
++            print(msg, flush=True)
+ 
+ 
+-def main() -> None:
+-    if len(sys.argv) < 3:
+-        print("Cach chay: python3 test_vai_b.py <ten_cua_ban> <cong_cua_ban> [cong_ban_be]")
+-        return
+-
+-    my_name = sys.argv[1]
+-    my_port = int(sys.argv[2])
+-
+-    state = SharedState(my_name=my_name, my_tcp_port=my_port, broadcast_addr="127.255.255.255")
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("name")
++    parser.add_argument("port", type=int)
++    parser.add_argument("friend_port", type=int, nargs="?")
++    parser.add_argument("--peer", action="append", default=[])
++    parser.add_argument("--downloads", default="downloads")
++    parser.add_argument("--slow", type=float, default=0.0)
++    parser.add_argument("--explicit-chat", action="store_true")
++    args = parser.parse_args()
++    if not 1 <= args.port <= 65535 or args.slow < 0 or not args.name.strip() or any(c in args.name for c in "|\r\n") or len(args.name.encode("utf-8")) > 256:
++        parser.error("Invalid name, port or delay.")
++    state = SharedState(args.name, args.port, "127.255.255.255")
+     ui = SimpleUI()
+-
+-    # Giả lập danh sách bạn bè online (thay thế phần của Vai A)
+-    if len(sys.argv) >= 4:
+-        friend_port = int(sys.argv[3])
+-        state.update_peer(("127.0.0.1", friend_port), "Ban_B", "online")
+-
+-    # Bật cổng lắng nghe TCP của Vai B
++    if args.friend_port is not None:
++        state.update_peer(("127.0.0.1", args.friend_port), "Ban_B", "online")
++    for entry in args.peer:
++        try:
++            name, address = entry.split("=", 1)
++            ip, port = address.rsplit(":", 1)
++            port = int(port)
++            if not name or not ip or not 1 <= port <= 65535:
++                raise ValueError()
++            state.update_peer((ip, port), name, "online")
++        except ValueError:
++            parser.error("Use --peer NAME=IP:PORT")
++    file_transfer.DOWNLOAD_DIR = os.path.abspath(args.downloads)
++    file_transfer.DEMO_CHUNK_DELAY = args.slow
++    tcp_manager.EXPLICIT_CHAT_OPEN = args.explicit_chat
+     acceptor = TCPAcceptor(state, ui)
+     acceptor.start()
+-
+-    print(f"[*] Da bat {my_name} tai cong {my_port}")
+-    print("[*] Cac lenh thu: /chat 1 | go tin nhan | /send <ten_file> | /leave | /quit")
+-
++    if not acceptor.ready.wait(5) or acceptor.error:
++        state.stop_event.set()
++        return
+     try:
+-        while True:
+-            line = input("> ")
+-            if not line.strip():
+-                continue
+-            if line.startswith("/chat"):
+-                arg = line[5:].strip()
+-                handle_chat_command(arg, state, ui)
+-            elif line.startswith("/send"):
+-                arg = line[5:].strip()
+-                handle_send_file_command(arg, state, ui)
+-            elif line.strip() == "/leave":
+-                handle_leave_command(state, ui)
+-            elif line.strip() == "/quit":
+-                state.stop_event.set()
+-                close_all_chats(state)
+-                break
+-            else:
+-                handle_send_text(line, state, ui)
++        from prompt_toolkit import PromptSession
++        from prompt_toolkit.patch_stdout import patch_stdout
++    except ImportError:
++        from contextlib import nullcontext
++        prompt = input
++        patch_stdout = nullcontext
++    else:
++        prompt = PromptSession().prompt
++    help_text = "/list | /chat <name|number> | /send <path> | /leave | /quit | /help"
++    print(f"[*] {args.name} listening on TCP {args.port}; static peers, no UDP")
++    print(help_text)
++    try:
++        with patch_stdout():
++            while True:
++                line = prompt("> ")
++                if not line.strip():
++                    continue
++                cmd, _, arg = line.partition(" ")
++                if cmd == "/chat":
++                    handle_chat_command(arg, state, ui)
++                elif cmd == "/send":
++                    handle_send_file_command(arg, state, ui)
++                elif cmd == "/leave":
++                    handle_leave_command(state, ui)
++                elif cmd == "/quit":
++                    break
++                elif cmd == "/list":
++                    for i, (key, info) in enumerate(state.get_peers_snapshot(), 1):
++                        ui.safe_print(f"{i}. {info['name']} {key[0]}:{key[1]} (static)")
++                elif cmd == "/help":
++                    ui.safe_print(help_text)
++                elif cmd.startswith("/"):
++                    ui.safe_print("[!] Unknown command. Use /help.")
++                else:
++                    handle_send_text(line, state, ui)
+     except (KeyboardInterrupt, EOFError):
++        pass
++    finally:
+         state.stop_event.set()
+         close_all_chats(state)
++        acceptor.join(2)
+ 
+ 
+ if __name__ == "__main__":
+-    main()+    main()
